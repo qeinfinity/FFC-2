@@ -40,7 +40,7 @@ g = sns.pairplot(
     height=2.0, aspect=1,
     plot_kws=dict(alpha=0.35, s=10, edgecolor="none")
 )
-g.fig.suptitle("Funding-curve factors vs. next-day BTC return\n(sampled)",
+g.figure.suptitle("Funding-curve factors vs. next-day BTC return\n(sampled)",
                y=1.02)
 plt.show()
 
