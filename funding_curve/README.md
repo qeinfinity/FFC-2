@@ -441,3 +441,97 @@ we also plot funding curve slope against return but of course yields nothing bec
 
 
 
+```
+**Dual risk pre-mortem (current FFC-2 branch)**  
+Operational  
+• Parquet fire-hose: 1 Hz snapshots → ≥40 GB/mo; slow append & fragile merge.  
+• `_reconnect()` stops after first yield → no exponential back-off; WS death = silent stall.  
+• Builder lacks gap-fill (network-brownout → NaNs propagate into PCA).  
+• PCA fitted once on full history; semver drift when live buckets ≠ training (rank-deficient).  
+• No CI over async collectors → schema/field drift undetected until runtime.  
+• Single process writes both exchanges → GIL contention spikes latency >2 s budget.  
+
+Tactical / market  
+• Second-PC may re-orient under regime shift; static loadings risk alpha flip.  
+• Retaining per-second micro-noise for regime classifier likely degrades SHARPE via label blur.  
+• Funding prints can be spoofed near roll; no outlier guard inflates variance.  
+• Crowding: many desks now use curve slope; alpha half-life <12 m without decay monitor.  
+
+**Integrated pipeline context (key decisions to revisit)**  
+Target-regime alignment: Using 1-s cadence implies intraday **Vol-Expansion** edge; but FFC-2 thesis is 8-h liquidation pivot → best for **Range→Trend-Down** transitions.  
+Market-mechanics: predicted funding often quotes stale within window; need last-trade TPS sync.  
+Latency budget: <2 s OK if snapshots throttled to roll; current design wastes 95 % CPU on unwritten duplicates.  
+Edge-decay monitor: not wired; add live SHARPE vs. back-test tracker on 30-sample rolling.  
+
+**Unknowns / clarifications**  
+1. Do downstream models truly need sub-minute FFC-2, or is 8-h roll sufficient?  
+2. Storage target (S3 + DuckDB, Postgres, or in-memory)? Impacts writer design.  
+3. Planned PCA refit cadence (rolling 21 d? monthly) and deployment path?  
+```
+
+so now will running snapshot.py produce a curve_live.parquet that is a reasonable size? after we get a new curve_live.parquet im assuming we need to run feature_build again, and then the final cell of the notebook that was previously taking more than 10mins and timing out should run 
+
+```
+Snapshot loop now instantiates `FundingCurveBuilder()` → default `emit_on_roll=True`.  
+Outcome: **one snapshot per 8-h funding roll per exchange** → 3 × 2 = 6 snapshots · 8 rows ≈ 48 rows day⁻¹.  
+At ~200 B row⁻¹ (Parquet+Snappy) that is **<10 kB day⁻¹**, i.e. <4 MB yr⁻¹ — essentially negligible versus the previous ≳40 GB mo⁻¹ fire-hose.  
+
+`seed_builder()` still feeds the last seven realised prints; they bypass the throttle because each has a distinct `funding_time`. You’ll see ≤7 historical snapshots written on start-up, then one every roll.  
+
+Downstream:  
+• `feature_build.py` unions `curve_history`+`curve_live` and recomputes factors — with the live file now tiny, wall-time drops from minutes to seconds.  
+• Notebook’s final cell mainly spends time loading `feature_store.parquet`; with the reduced live delta it should execute comfortably under **30 s** even without Polars.  
+```
+
+ok yes but the effort is not just live emissions but to explore the historical funding rate curve (which the last cell in the 01_curve_qc.ipynb seeks to do
+will running snapshot take care of the backfill correctly ? i believe curve_live has every new snapshot appended to it but also backfilled with curve_history. 
+
+*patched `FILE: funding_curve/pipelines/snapshot.py `*
+
+```
+**Behaviour after patch**
+
+* **Back-fill coverage** – snapshot loop now writes an initial 8-row curve for each exchange using the last 64 h realised prints; you **no longer need to run the heavy `ingest.py`** just to explore recent history.  
+* **File growth** – afterward only one 8-row snapshot per 8-h roll is appended, keeping `curve_live.parquet` tiny (≈ 4 MB yr⁻¹).  
+* **Historical research** – for reaches beyond 64 h simply run `ingest.py` once (start date configurable) which saves to `curve_history.parquet`; `feature_build` automatically unions both files.  
+* **Notebook performance** – feature build now touches a small delta; the final cell loads a lean `feature_store.parquet` and should finish in <30 s on a laptop.  
+```
+
+```
+**Workflow recap**
+
+```
+# one-off long back-fill (optional for >64 h look-back)
+poetry run python -m funding_curve.pipelines.ingest --start 2021-01-01
+
+# start live throttled loop (includes 64 h seed snapshot)
+poetry run python -m funding_curve.pipelines.snapshot
+# keep running in tmux / systemd
+
+# whenever you want fresh factors
+poetry run python -m funding_curve.feature_build
+# -> storage/processed/feature_store.parquet updated
+
+# open notebooks/01_curve_qc.ipynb  – cells now fast
+```
+
+
+
+RAN THE LONG BACKFILL BUT SOMEHOW ISNT ENDING UP IN FEATURE_STORE.PARQUET.
+
+```
+funding-curve-py3.13boscovich@Mac funding_curve % poetry run python -m funding_curve.pipelines.ingest --start 2021-01-01
+2025-05-05 23:46:22.543 | INFO     | __main__:_ingest_exchange:59 - [binance] ingesting 2021-01-01 → 2025-05-05
+2025-05-05 23:46:22.543 | INFO     | __main__:_ingest_exchange:59 - [bybit] ingesting 2021-01-01 → 2025-05-05
+2025-05-05 23:58:50.411 | SUCCESS  | __main__:_ingest_exchange:65 - [binance] done.
+2025-05-05 23:59:01.058 | SUCCESS  | __main__:_ingest_exchange:65 - [bybit] done.
+2025-05-05 23:59:01.058 | INFO     | __main__:main:92 - Historical ingest complete. File saved to %s
+funding-curve-py3.13boscovich@Mac funding_curve % poetry run python -m funding_curve.pipelines.snapshot
+/Users/boscovich/Documents/dev/funding_termstructure/funding_curve/funding_curve/pipelines/snapshot.py:71: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+2025-05-06 00:00:41.912 | WARNING  | __main__:main:90 - No initial snapshot generated during seeding phase.
+2025-05-06 00:00:42.761 | DEBUG    | __main__:_pipe:54 - live snapshot appended: %s / %s
+2025-05-06 00:00:45.158 | DEBUG    | __main__:_pipe:54 - live snapshot appended: %s / %s
+
+```
+
